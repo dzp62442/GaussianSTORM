@@ -29,10 +29,11 @@ conda create -n storm python=3.10 -y
 conda activate storm
 
 # install python dependencies
+pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu118
 pip install -r requirements.txt
 
 # install gsplat (for batch-wise rendering support)
-pip install git+https://github.com/nerfstudio-project/gsplat.git@2b0de894232d21e8963179a7bbbd315f27c52c9c
+pip install git+https://github.com/nerfstudio-project/gsplat.git@2b0de894232d21e8963179a7bbbd315f27c52c9c --no-build-isolation
 #   └─ if the above fails, drop the commit hash:
 #       pip install git+https://github.com/nerfstudio-project/gsplat.git
 ```
