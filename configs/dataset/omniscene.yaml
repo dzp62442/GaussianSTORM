@@ -1,0 +1,29 @@
+# configs/dataset/omniscene.yaml
+dataset: omniscene
+data_root: /home/B_UserData/dongzhipeng/Datasets/dataset_omniscene
+data_version: interp_12Hz_trainval
+train_manifest: bins_train_3.2m.json
+eval_manifest: bins_val_3.2m.json
+camera_order: [CAM_FRONT, CAM_FRONT_RIGHT, CAM_FRONT_LEFT,
+               CAM_BACK, CAM_BACK_LEFT, CAM_BACK_RIGHT]
+context_indices: [0]
+novel_indices: [1, 2]
+append_context_to_targets: true
+num_context_timesteps: 1
+num_target_timesteps: 1
+num_max_cameras: 6
+timespan: 2.0                 # 保留非零归一化常数；实际时间恒为 0
+static_scene: true           # 新增：拒绝真实时间并绕过位移计算
+load_depth: true             # 目标 Metric3D，不是 LiDAR
+load_flow: false
+load_ground: false
+skip_sky_mask: true
+use_dynamic_mask: true
+dynamic_mask_scope: novel_12 # 已确认：末尾 6 路输入视角目标全有效
+load_rel_depth_train: false
+load_rel_depth_eval: true
+relative_depth_source: da2
+subset_ratio: 1.0
+val_selection: {stop: 30000, stride: 3000, limit: 10}
+mini_selection: {offset: 0, stride: 14, limit: 2048}
+test_selection: all

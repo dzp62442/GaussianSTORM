@@ -99,7 +99,7 @@ def get_args_parser():
     parser.add_argument("--load_ground", action="store_true")
     parser.add_argument("--load_depth", action="store_true")
     parser.add_argument("--load_flow", action="store_true")
-    parser.add_argument("--dataset", default="waymo", type=str, choices=DATASET_DICT.keys())
+    parser.add_argument("--dataset", default="waymo", type=str, choices=[*DATASET_DICT, "omniscene"])
     parser.add_argument("--subset_ratio", default=1.0, type=float)
     parser.add_argument("--num_workers", default=16, type=int)
     parser.add_argument("--skip_sky_mask", action="store_true", help="skip sky mask loading")
@@ -130,6 +130,9 @@ def get_args_parser():
 
 
 def main(args):
+    if args.dataset == "omniscene":
+        from storm.omniscene_runner import run
+        return run(args)
     # Prepare distributed training
     distributed.enable(overwrite=True)
 
@@ -512,5 +515,6 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = get_args_parser().parse_args()
+    from storm.omniscene_config import parse_args
+    args = parse_args(get_args_parser())
     main(args)

@@ -38,6 +38,7 @@ class STORM(ViT):
         grad_checkpointing=True,
         use_latest_gsplat=False,
         sigmoid_rgb=False, # a legacy oversight: the sigmoid was accidentally omitted in the earlier implementation
+        static_scene=False,
         **kwargs,
     ):
         super(STORM, self).__init__(
@@ -56,6 +57,9 @@ class STORM(ViT):
         self.num_cams = num_cams
         self.grad_checkpointing = grad_checkpointing
         self.use_latest_gsplat = use_latest_gsplat
+        self.static_scene = static_scene
+        if static_scene and decoder_type != "dummy":
+            raise ValueError("Static OmniScene requires the pixel/dummy decoder")
 
         # ------- STORM v.s. Latent-STORM -------
         self.decoder_type = decoder_type
@@ -300,6 +304,8 @@ class STORM(ViT):
         }
 
     def forward_renderer(self, gs_params, data_dict, render_motion_seg=True, radius_clip=0.0):
+        if self.static_scene:
+            return self.render_static(gs_params, data_dict, radius_clip=radius_clip)
         b, t, v, h, w, _ = gs_params["means"].shape
         tgt_h, tgt_w = data_dict["height"], data_dict["width"]
         tgt_t, tgt_v = data_dict["target_camtoworlds"].shape[1:3]
@@ -532,6 +538,14 @@ class STORM(ViT):
         return data_dict, ray_dict
 
     def forward(self, data_dict):
+        if self.static_scene:
+            context = {key: data_dict[key] for key in (
+                "context_image", "context_intrinsics", "context_camtoworlds", "context_time")}
+            gs_params = self.reconstruct_static(context)
+            rendered = self.render_static(
+                gs_params, data_dict, depth_mode=data_dict.get("depth_mode", "expected_z"),
+                chunk_size=data_dict.get("render_chunk_size", 6))
+            return {"gs_params": gs_params, "render_results": rendered}
         x = data_dict["context_image"]
         b, t, v, c, h, w = x.size()
         data_dict, ray_dict = self.get_ray_dict(data_dict)
@@ -606,6 +620,11 @@ class STORM(ViT):
         }
 
     def from_gs_params_to_output(self, gs_params, target_dict, num_cams=1):
+        if self.static_scene:
+            return {"render_results": self.render_static(
+                gs_params, target_dict, depth_mode=target_dict.get("depth_mode", "expected_z"),
+                chunk_size=target_dict.get("render_chunk_size", 6),
+                radius_clip=target_dict.get("radius_clip", 0.0))}
         render_results = self.forward_renderer(
             gs_params, target_dict, render_motion_seg=False, radius_clip=4.0
         )
@@ -637,6 +656,8 @@ class STORM(ViT):
         return {"render_results": render_results}
 
     def get_gs_params(self, data_dict):
+        if self.static_scene:
+            self._check_static_context(data_dict)
         x = data_dict["context_image"]
         data_dict, ray_dict = self.get_ray_dict(data_dict)
         x = self.forward_features(x, ray_dict["plucker"], data_dict["context_time"])
@@ -664,6 +685,87 @@ class STORM(ViT):
             affine = rearrange(affine, "b v (p q) -> b v p q", p=self.gs_dim)
             gs_params["affine"] = affine
         return gs_params
+
+    def _check_static_context(self, context):
+        if not self.static_scene:
+            raise ValueError("Enable static_scene for OmniScene reconstruction")
+        if torch.count_nonzero(context["context_time"]).item():
+            raise ValueError("Static reconstruction accepts zero context times only")
+        if context["context_image"].shape[1:3] != (1, self.num_cams):
+            raise ValueError("Static reconstruction needs one frame per physical camera")
+
+    def reconstruct_static(self, context):
+        """Complete reconstruction, including RGB normalization; input RGB is [0,1]."""
+        allowed = {"context_image", "context_intrinsics", "context_camtoworlds", "context_time"}
+        if set(context) != allowed:
+            raise ValueError(f"Reconstruction input keys must be exactly {sorted(allowed)}")
+        self._check_static_context(context)
+        context = {**context, "context_image": context["context_image"] * 2 - 1}
+        return self.get_gs_params(context)
+
+    def render_static(self, gs_params, cameras, depth_mode="expected_z", chunk_size=6,
+                      radius_clip=0.0):
+        """Render unchanged Gaussian centers; velocity is never used for translation.
+
+        The pinned gsplat API is batched. RGB retains the original sky and affine
+        operators, while expected/accumulated depth stay separate from RGB processing.
+        """
+        if not self.static_scene or self.use_latest_gsplat:
+            raise ValueError("Static renderer requires the pinned batched gsplat backend")
+        for key in ("context_time", "target_time"):
+            if torch.count_nonzero(cameras[key]).item():
+                raise ValueError(f"Static rendering requires zero {key}")
+        if depth_mode not in {"expected_z", "accumulated_z"} or chunk_size < 1:
+            raise ValueError("Invalid static render configuration")
+        c2w, intrinsics = cameras["target_camtoworlds"], cameras["target_intrinsics"]
+        b, t, v = c2w.shape[:3]
+        if t != 1:
+            raise ValueError("Static targets must have one dummy time dimension")
+        ids = cameras["target_camera_ids"]
+        if ids.shape != (b, t, v) or (ids < 0).any() or (ids >= self.num_cams).any():
+            raise ValueError("Invalid target camera IDs")
+        flat = {key: value.reshape(b, -1, value.shape[-1]).float() for key, value in
+                gs_params.items() if key in {"means", "scales", "quats", "colors"}}
+        opacity = gs_params["opacities"].reshape(b, -1).float()
+        mode = "RGB+ED" if depth_mode == "expected_z" else "RGB+D"
+        # Invert all cameras together: linalg kernels can round differently for
+        # different batch sizes, which otherwise moves a few rasterization edges.
+        with torch.autocast(device_type=c2w.device.type, enabled=False):
+            viewmats = torch.linalg.inv(c2w[:, 0].float())
+        pieces = []
+        for start in range(0, v, chunk_size):
+            stop = min(start + chunk_size, v)
+            k, pose = intrinsics[:, :, start:stop], c2w[:, :, start:stop]
+            # FP32 rasterization mirrors STORM's native autocast boundary.
+            with torch.autocast(device_type=c2w.device.type, enabled=False):
+                pixels, alpha, _ = rasterization(
+                    means=flat["means"], scales=flat["scales"], quats=flat["quats"],
+                    opacities=opacity, colors=flat["colors"],
+                    viewmats=viewmats[:, start:stop].contiguous(),
+                    Ks=k[:, 0].float().contiguous(), width=cameras["width"], height=cameras["height"],
+                    near_plane=self.near, far_plane=self.far, radius_clip=radius_clip,
+                    render_mode=mode, packed=False)
+            rgb, depth = pixels[..., :self.gs_dim][:, None], pixels[..., -1][:, None]
+            alpha = alpha[..., 0][:, None]
+            expected = depth if depth_mode == "expected_z" else depth / alpha.clamp(min=1e-10)
+            accumulated = depth if depth_mode == "accumulated_z" else depth * alpha.clamp(min=1e-10)
+            if self.use_sky_token:
+                rays = self.plucker_embedder(k, pose, image_size=(cameras["height"], cameras["width"]))
+                if self.training and self.grad_checkpointing:
+                    sky = checkpoint(self.sky_head, rays["dirs"], gs_params["sky_token"], use_reentrant=False)
+                else:
+                    sky = self.sky_head(rays["dirs"], gs_params["sky_token"])
+                rgb = rgb + (1 - alpha[..., None]) * sky
+            if self.use_affine_token:
+                selected = torch.stack([gs_params["affine"][i][ids[i, :, start:stop]] for i in range(b)])
+                # Deliberately retain the author's operator (including its q reduction).
+                rgb = torch.einsum("b t v h w p, b t v p q -> b t v h w p", rgb, selected)
+            pieces.append({"rendered_image": rgb, "rendered_depth": expected,
+                           "accumulated_depth": accumulated, "rendered_alpha": alpha})
+        output = {key: torch.cat([part[key] for part in pieces], dim=2) for key in pieces[0]}
+        output = self.forward_decoder(output)
+        output["flow_key"] = None  # Flow is regularized in 3D, not rasterized or displaced.
+        return output
 
 
 def STORM_B_8(**kwargs):

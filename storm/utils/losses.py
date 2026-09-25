@@ -5,7 +5,7 @@ from einops import rearrange
 from storm.dataset.constants import MEAN, STD
 
 
-def compute_depth_loss(pred_depth, gt_depth, max_depth=None):
+def compute_depth_loss(pred_depth, gt_depth, max_depth=None, valid_region=None):
     pred_depth = pred_depth.squeeze()
     gt_depth = gt_depth.squeeze()
     if pred_depth.shape != gt_depth.shape:
@@ -30,9 +30,15 @@ def compute_depth_loss(pred_depth, gt_depth, max_depth=None):
                 align_corners=False,
             )
             pred_depth = rearrange(pred_depth, "(b t v) 1 h w -> b t v h w", b=b, t=t, v=v)
-    valid_mask = gt_depth > 0.01
+    valid_mask = torch.isfinite(gt_depth) & (gt_depth > 0.01)
     if max_depth is None:
-        max_depth = gt_depth.max()
+        if not valid_mask.any():
+            raise ValueError("No finite positive target depth")
+        max_depth = gt_depth[valid_mask].max()
+    if valid_region is not None:
+        valid_mask = valid_mask & valid_region.squeeze().bool()
+    if not valid_mask.any():
+        raise ValueError("No valid supervised depth pixels")
     pred_depth = pred_depth[valid_mask] / max_depth
     gt_depth = gt_depth[valid_mask] / max_depth
     return F.l1_loss(pred_depth, gt_depth)
@@ -80,16 +86,23 @@ def compute_loss(output_dict, target_dict, args=None, lpips_loss=None):
     mean, std = torch.tensor(MEAN).to(device), torch.tensor(STD).to(device)
     pred_rgb = pred_dict[pred_dict["rgb_key"]] * std + mean
     target_rgb = rearrange(target_dict["target_image"], "b t v c h w -> b t v h w c") * std + mean
+    valid_region = target_dict.get("target_valid_mask") if getattr(args, "use_dynamic_mask", False) else None
 
     if lpips_loss is not None:
-        loss_dict = lpips_loss(pred_rgb, target_rgb)
+        loss_dict = (lpips_loss(pred_rgb, target_rgb, valid_mask=valid_region)
+                     if valid_region is not None else lpips_loss(pred_rgb, target_rgb))
     else:
-        rgb_loss = F.mse_loss(pred_rgb, target_rgb)
+        if valid_region is None:
+            rgb_loss = F.mse_loss(pred_rgb, target_rgb)
+        else:
+            if not valid_region.flatten(-2).any(dim=-1).all():
+                raise ValueError("No valid RGB pixels in a target")
+            rgb_loss = (pred_rgb - target_rgb)[valid_region].square().mean()
         loss_dict = {"rgb_loss": rgb_loss}
 
     if args.enable_depth_loss and "target_depth" in target_dict:
         pred_depth, target_depth = pred_dict[pred_dict["depth_key"]], target_dict["target_depth"]
-        depth_loss = compute_depth_loss(pred_depth, target_depth)
+        depth_loss = compute_depth_loss(pred_depth, target_depth, valid_region=valid_region)
         loss_dict["depth_loss"] = depth_loss
 
         if pred_dict["decoder_depth_key"] is not None:
@@ -106,7 +119,7 @@ def compute_loss(output_dict, target_dict, args=None, lpips_loss=None):
                 )
                 loss_dict["sky_decodede_depth_loss"] = sky_decoded_depth_loss
 
-    if args.enable_flow_reg_loss and pred_dict["flow_key"] is not None:
+    if args.enable_flow_reg_loss and (pred_dict["flow_key"] is not None or getattr(args, "dataset", None) == "omniscene"):
         pred_flow = gs_params["forward_flow"]
         zero_flow = torch.zeros_like(gs_params["forward_flow"]).to(device)
         forward_flow_reg = F.mse_loss(pred_flow, zero_flow, reduction="none")

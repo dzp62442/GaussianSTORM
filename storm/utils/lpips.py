@@ -48,7 +48,7 @@ def get_ckpt_path(name, root, check=False):
 
 class LPIPS(nn.Module):
     # Learned perceptual metric
-    def __init__(self, use_dropout=True):
+    def __init__(self, use_dropout=True, weights_path=None, offline=False):
         super().__init__()
         self.scaling_layer = ScalingLayer()
         self.chns = [64, 128, 256, 512, 512]  # vg16 features
@@ -58,12 +58,19 @@ class LPIPS(nn.Module):
         self.lin2 = NetLinLayer(self.chns[2], use_dropout=use_dropout)
         self.lin3 = NetLinLayer(self.chns[3], use_dropout=use_dropout)
         self.lin4 = NetLinLayer(self.chns[4], use_dropout=use_dropout)
-        self.load_from_pretrained()
+        self.load_from_pretrained(weights_path=weights_path, offline=offline)
         for param in self.parameters():
             param.requires_grad = False
 
-    def load_from_pretrained(self, name="vgg_lpips"):
-        ckpt = get_ckpt_path(name, "ckpts/lpips", check=True)
+    def load_from_pretrained(self, name="vgg_lpips", weights_path=None, offline=False):
+        if weights_path is not None:
+            ckpt = str(weights_path)
+            if not os.path.isfile(ckpt) or md5_hash(ckpt) != MD5_MAP[name]:
+                raise ValueError(f"Missing/invalid local STORM LPIPS weights: {ckpt}")
+        elif offline:
+            raise ValueError("Offline LPIPS requires an existing weights_path")
+        else:
+            ckpt = get_ckpt_path(name, "ckpts/lpips", check=True)
         self.load_state_dict(torch.load(ckpt, map_location=torch.device("cpu")), strict=False)
         print("loaded pretrained LPIPS loss from {}".format(ckpt))
 

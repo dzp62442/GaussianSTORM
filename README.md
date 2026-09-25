@@ -71,6 +71,24 @@ We haven't included instructions for preparing NuScenes and Argoverse2 datasets.
 
 ## Training
 
+### OmniScene（SVF-GS 对比实验）
+
+`comp_svfgs` 支持静态六相机输入、18 路目标监督，分别汇总 `all_18` / `novel_12` 的 PSNR、SSIM、LPIPS、DA2 PCC，以及模型参数量和完整高斯重建耗时。两种分辨率独立从头训练，W&B 强制离线。
+
+```bash
+# 查看最终配置；不加载模型或使用 GPU
+python main_storm.py --config configs/experiment/omniscene_112x200.yaml --dry_run
+# 正式训练前检查现有资产；默认检查训练和完整评估清单
+python main_storm.py --config configs/experiment/omniscene_112x200.yaml --mode check-data
+
+python main_storm.py --config configs/experiment/omniscene_112x200.yaml
+python main_storm.py --config configs/experiment/omniscene_224x400.yaml
+```
+
+两个训练命令应独立启动并按实际 GPU 资源安排。配置、恢复/测试命令、离线权重要求、调试显存限制及已完成的验证见 [OmniScene 数据集实验文档](<docs/OmniScene 数据集实验文档.md>)。OmniScene 必须使用上面固定 commit 的 gsplat，不适用省略 commit hash 的安装回退。
+
+### Original STORM training
+
 Multi-GPU example that reproduces the paper's STORM-B/8 model:
 
 ```bash
@@ -133,5 +151,3 @@ This project is licensed under the **NVIDIA License**. See the [LICENSE](LICENSE
 
 Our implementation builds upon **gsplat**.
 We thank the respective authors for open‑sourcing their excellent work.
-
-

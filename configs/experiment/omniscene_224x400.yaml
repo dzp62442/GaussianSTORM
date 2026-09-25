@@ -1,0 +1,4 @@
+# configs/experiment/omniscene_224x400.yaml
+extends: omniscene_base.yaml
+input_size: [224, 400]
+exp_name: STORM-B-8_omniscene_224x400

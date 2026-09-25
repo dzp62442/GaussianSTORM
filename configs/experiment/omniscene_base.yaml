@@ -1,0 +1,65 @@
+# configs/experiment/omniscene_base.yaml
+dataset_config: ../dataset/omniscene.yaml
+model: STORM-B/8
+gs_dim: 3
+decoder_type: dummy
+num_cams: 6                  # 需实际传入 STORM 构造函数
+num_motion_tokens: 16
+use_sky_token: true
+use_affine_token: true
+use_latest_gsplat: false
+near: 0.2
+far: 400.0
+scale_offset: -2.3
+opacity_offset: -2.0
+max_scale: 0.5
+tau: 0.5
+projected_motion_dim: 32
+disable_pos_embed: false
+sigmoid_rgb: false           # 保留本项目当前实现
+disable_grad_checkpointing: false
+enable_depth_loss: true
+enable_flow_reg_loss: true
+flow_reg_coeff: 0.005
+enable_perceptual_loss: true
+perceptual_weight: 0.05
+perceptual_loss_start_iter: 5000
+enable_sky_depth_loss: false
+enable_sky_opacity_loss: false
+lr: 0.0004
+lr_sched: cosine
+min_lr: 0.0
+warmup_iters: 5000
+weight_decay: 0.05
+grad_clip: 3.0
+batch_size: 1
+eval_batch_size: 1
+test_batch_size: 1
+num_iterations: 100001
+val_every_n_iters: 1000
+test_every_n_validations: 10
+test_at_training_end: true
+ckpt_every_n_iters: 5000
+keep_n_ckpts: 1
+save_final_checkpoint: true
+log_every_n_iters: 50
+vis_every_n_iters: 5000
+num_vis_samples: 1
+eval_view_groups: [all_18, novel_12]
+pcc_depth_mode: accumulated_z
+train_depth_mode: expected_z
+eval_radius_clip: 0.0
+eval_render_chunk_size: 6
+timing_warmup_samples: 5
+num_workers: 16
+seed: 1
+precision: bf16
+load_from: null
+resume_from: null
+auto_resume: false
+enable_wandb: true
+wandb_mode: offline          # 启动时自动应用，无需手动 export WANDB_MODE
+enable_feishu: true          # 训练启动与 mini 测试完成后推送；失败不打断训练
+feishu_module_paths: [~/Libraries, /vepfs-mlp2/c20250502/haoce/dzp]
+project: omniscene
+output_dir: ./work_dirs

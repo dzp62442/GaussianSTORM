@@ -25,3 +25,12 @@ loguru
 
 torch_kmeans
 pynvml
+
+# OmniScene configuration and evaluation (PyTorch/CUDA stay environment-pinned)
+PyYAML>=6.0
+scikit-image==0.25.2
+lpips==0.1.4
+
+# External auto_monitor.send_feishu module (same interface as SVF-GS)
+requests>=2.28
+python-dotenv>=1.0

@@ -212,6 +212,7 @@ class WandbLogger:
             dir=args.log_dir,
             resume=resume,
             id=id,
+            mode=getattr(args, "wandb_mode", None) if args.dataset == "omniscene" else None,
         )
         self.run_id = wandb.run.id
         self.step = 0
