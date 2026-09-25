@@ -146,8 +146,13 @@ def validate_config(args):
     if (not isinstance(args.feishu_module_paths, list)
             or any(not isinstance(path, str) or not path.strip() for path in args.feishu_module_paths)):
         raise ValueError("feishu_module_paths must be a list of nonempty paths")
-    if args.load_from and (args.resume_from or args.auto_resume):
+    if type(args.auto_resume) is not bool:
+        raise ValueError("auto_resume must be a boolean")
+    # Automatic training resume must not conflict with standalone test weights.
+    if args.load_from and args.resume_from:
         raise ValueError("load_from and training resume are mutually exclusive")
+    if args.resume_from and args.mode != "train":
+        raise ValueError("resume_from is only supported in train mode")
     if args.mode == "train" and args.load_from:
         raise ValueError("OmniScene trains from scratch; use resume_from to resume")
     if args.start_iteration:

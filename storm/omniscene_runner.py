@@ -90,13 +90,16 @@ def save_checkpoint(path, model, optimizer, scaler, state, args, train_dataset, 
 
 
 def select_resume(args, checkpoints):
+    """Resolve only this experiment's checkpoints; an explicit path takes precedence."""
+    if args.mode != "train":
+        return None
     if args.resume_from:
         return Path(args.resume_from)
     if args.auto_resume:
         final = checkpoints / "ckpt_final.pth"
         if final.is_file():
             return final
-        choices = sorted(checkpoints.glob("ckpt_step_*.pth"))
+        choices = sorted(path for path in checkpoints.glob("ckpt_step_*.pth") if path.is_file())
         if choices:
             return choices[-1]
     return None
@@ -195,9 +198,11 @@ def train(model, args, device, log_dir, checkpoints, provenance):
     state = TrainingState()
     resume = select_resume(args, checkpoints)
     if not resume and any(checkpoints.glob("*.pth")):
-        raise FileExistsError(f"Checkpoints already exist in {checkpoints}; use --resume_from or a new exp_name")
+        raise FileExistsError(f"Checkpoints already exist in {checkpoints}; enable auto_resume, "
+                              "use --resume_from or a new exp_name")
     pending_rng = None
     if resume:
+        LOGGER.info("Restoring complete training state from %s", resume)
         payload = torch.load(resume, map_location="cpu")
         if payload["signature"] != training_signature(args):
             changed = [key for key in payload["signature"] if payload["signature"][key] != training_signature(args).get(key)]
@@ -216,6 +221,17 @@ def train(model, args, device, log_dir, checkpoints, provenance):
         del payload
     if not 0 <= state.completed_steps <= args.num_iterations:
         raise ValueError("Invalid checkpoint step count")
+    if state.completed_steps == args.num_iterations and state.final_test_complete:
+        LOGGER.info("Experiment already complete: %d updates and final mini test; no further training. %s",
+                    state.completed_steps, resume)
+        return asdict(state)
+    if resume:
+        LOGGER.info("Resuming after %d/%d updates; pending evaluations will run first.",
+                    state.completed_steps, args.num_iterations)
+    else:
+        LOGGER.info("No checkpoint selected in %s; starting training from scratch.", checkpoints)
+    provenance = {**provenance, "resume_from": str(resume) if resume else None,
+                  "resume_completed_steps": state.completed_steps}
     (log_dir / "resolved_config.yaml").write_text(yaml.safe_dump(vars(args), allow_unicode=True, sort_keys=True))
     write_json(log_dir / "provenance.json", provenance)
     parameters = count_parameters(model)

@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import pickle
+import random
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -18,7 +19,7 @@ from storm.dataset.omniscene_adapter import prepare_omniscene_batch
 from storm.dataset.omniscene_dataset import CAMERA_IDS, OmniSceneDataset, da2_to_relative_depth
 from storm.evaluation.omniscene import aggregate_records, compute_pcc, group_records
 from storm.omniscene_config import CAMERAS, ROOT, load_config, parse_args
-from storm.omniscene_runner import TrainingState
+from storm.omniscene_runner import TrainingState, select_resume
 from storm.utils.experiment import summarize_times
 from storm.utils.losses import compute_depth_loss, compute_loss
 from storm.utils.lpips_loss import RGBLpipsLoss
@@ -40,6 +41,47 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(high.input_size, [224, 400])
         self.assertEqual(high.num_iterations, 100001)
         self.assertEqual(high.num_cams, 6)
+        self.assertTrue(low.auto_resume)
+        self.assertTrue(high.auto_resume)
+        self.assertFalse(config("--no-auto_resume").auto_resume)
+
+    def test_auto_resume_does_not_block_standalone_test(self):
+        args = config("--mode", "test", "--load_from", "checkpoint.pth")
+        self.assertTrue(args.auto_resume)
+        self.assertEqual(Path(args.load_from).name, "checkpoint.pth")
+        self.assertIsNone(select_resume(args, ROOT / "work_dirs"))
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            config("--mode", "test", "--load_from", "checkpoint.pth", "--resume_from", "checkpoint.pth")
+        with self.assertRaisesRegex(ValueError, "only supported in train"):
+            config("--mode", "test", "--resume_from", "checkpoint.pth")
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            config("--set", 'auto_resume="false"')
+
+    def test_auto_resume_selects_only_current_experiment_and_complete_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current = root / "low" / "checkpoints"
+            other = root / "high" / "checkpoints"
+            current.mkdir(parents=True)
+            other.mkdir(parents=True)
+            (other / "ckpt_final.pth").touch()
+            (current / "ckpt_step_020000.pth.tmp").touch()
+            (current / "ckpt_final.pth.tmp").touch()
+            args = config()
+            self.assertIsNone(select_resume(args, current))
+            older = current / "ckpt_step_005000.pth"
+            latest = current / "ckpt_step_010000.pth"
+            for path in (latest, older):
+                path.touch()
+            self.assertEqual(select_resume(args, current), latest)
+            args.auto_resume = False
+            self.assertIsNone(select_resume(args, current))
+            args.auto_resume = True
+            final = current / "ckpt_final.pth"
+            final.touch()
+            self.assertEqual(select_resume(args, current), final)
+            args.resume_from = str(older)
+            self.assertEqual(select_resume(args, current), older)
 
     def test_reject_protocol_changes(self):
         for override in ["load_rel_depth_train=true", "static_scene=false", "num_cams=3", "batch_size=2",
@@ -307,7 +349,8 @@ class TrainingRecoveryTests(unittest.TestCase):
                 self.weight = torch.nn.Parameter(torch.tensor(.3))
 
             def forward(self, inputs):
-                return self.weight * inputs["feature"]
+                noise = torch.rand_like(inputs["feature"]) + random.random() + np.random.random()
+                return self.weight * inputs["feature"] * noise
 
         class NoPerceptual(torch.nn.Module):
             def __init__(self, **kwargs):
@@ -346,6 +389,8 @@ class TrainingRecoveryTests(unittest.TestCase):
             root = Path(directory) / "resumed"
             checkpoints = root / "checkpoints"
             checkpoints.mkdir(parents=True)
+            from storm.utils.misc import fix_random_seeds
+            fix_random_seeds(args.seed)
             model = ToyModel()
             with self.assertRaisesRegex(RuntimeError, "injected"):
                 train(model, args, torch.device("cpu"), root, checkpoints, {})
@@ -356,7 +401,10 @@ class TrainingRecoveryTests(unittest.TestCase):
             pending = torch.load(resume_path, map_location="cpu")
             self.assertEqual(pending["state"]["completed_steps"], 2)
             self.assertEqual(pending["state"]["validation_count"], 1)
-            args.resume_from = str(resume_path)
+            self.assertIsNone(args.resume_from)
+            self.assertTrue(args.auto_resume)
+            # Simulate a fresh process with unrelated RNG state; auto-resume must restore it.
+            fix_random_seeds(99)
             resumed = ToyModel()
             result = train(resumed, args, torch.device("cpu"), root, checkpoints, {})
             self.assertEqual(result["completed_steps"], 3)
@@ -368,9 +416,13 @@ class TrainingRecoveryTests(unittest.TestCase):
             self.assertIn("训练恢复", sender.call_args_list[1].args[0])
             self.assertIn("已完成迭代：2/3", sender.call_args_list[2].args[1])
             self.assertIn("最终 mini 测试完成", sender.call_args_list[3].args[0])
+            provenance = json.loads((root / "provenance.json").read_text())
+            self.assertEqual(provenance["resume_from"], str(resume_path))
+            self.assertEqual(provenance["resume_completed_steps"], 2)
 
             # Compare resumed updates and sampler cursor against uninterrupted execution.
             args.resume_from = None
+            fix_random_seeds(args.seed)
             reference = ToyModel()
             control = Path(directory) / "control"
             (control / "checkpoints").mkdir(parents=True)
@@ -383,7 +435,8 @@ class TrainingRecoveryTests(unittest.TestCase):
             payload["state"]["final_test_complete"] = False
             payload["state"]["tested_steps"] = [2]
             torch.save(payload, final)
-            args.resume_from = str(final)
+            # Auto-discovery must also find a final checkpoint awaiting its mini test.
+            self.assertIsNone(args.resume_from)
             events.clear()
             train(ToyModel(), args, torch.device("cpu"), root, checkpoints, {})
             self.assertEqual(events, [("mini", 3)])
@@ -391,9 +444,24 @@ class TrainingRecoveryTests(unittest.TestCase):
             self.assertTrue(final_payload["state"]["final_test_complete"])
             events.clear()
             sender.reset_mock()
-            train(ToyModel(), args, torch.device("cpu"), root, checkpoints, {})
+            final_bytes = final.read_bytes()
+            before_provenance = (root / "provenance.json").read_bytes()
+            with patch("storm.omniscene_runner.ImageMetrics") as metrics:
+                completed = train(ToyModel(), args, torch.device("cpu"), root, checkpoints, {})
+                metrics.assert_not_called()
+            self.assertTrue(completed["final_test_complete"])
+            self.assertEqual(final.read_bytes(), final_bytes)
+            self.assertEqual((root / "provenance.json").read_bytes(), before_provenance)
             self.assertEqual(events, [])
             sender.assert_not_called()
+            args.auto_resume = False
+            with self.assertRaises(FileExistsError):
+                train(ToyModel(), args, torch.device("cpu"), root, checkpoints, {})
+            args.auto_resume = True
+            args.lr = .0003
+            with self.assertRaisesRegex(ValueError, "Resume config differs"):
+                train(ToyModel(), args, torch.device("cpu"), root, checkpoints, {})
+            args.lr = .0004
             final_payload["eval_manifest_sha256"] = "a-different-evaluation-manifest"
             torch.save(final_payload, final)
             with self.assertRaisesRegex(ValueError, "Evaluation manifest"):

@@ -56,7 +56,7 @@ seed: 1
 precision: bf16
 load_from: null
 resume_from: null
-auto_resume: false
+auto_resume: true            # 自动恢复当前实验目录中的 checkpoint；无 checkpoint 则从头训练
 enable_wandb: true
 wandb_mode: offline          # 启动时自动应用，无需手动 export WANDB_MODE
 enable_feishu: true          # 训练启动与 mini 测试完成后推送；失败不打断训练

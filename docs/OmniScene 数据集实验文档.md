@@ -162,7 +162,7 @@ seed: 1
 precision: bf16
 load_from: null
 resume_from: null
-auto_resume: false
+auto_resume: true            # 默认自动恢复当前实验目录
 enable_wandb: true
 wandb_mode: offline
 enable_feishu: true
@@ -253,6 +253,10 @@ i >= W: lr(i) = lr_min + (lr_max-lr_min)/2
 原项目已有周期 evaluate 和训练后 evaluate，但没有独立“每 N 次验证测试”的计数器。适配时新增 `val` 与 `mini_test` 两条评估路径，仍由本项目循环调用。可视化也改用静态目标协议，不调用要求真实时间/天空/场景流的原逻辑。
 
 断点恢复要保存模型、optimizer、scaler、已完成步数、验证次数、已完成的 mini 测试步数、随机状态与采样状态。若最终 checkpoint 已保存但最终 mini 测试未完成，恢复时补做最终测试后才标记训练完成。离线 W&B 不执行 sync；LPIPS/VGG 的已有权重在启动前检查，缺失时报告，不在训练途中联网下载。
+
+自动续训默认启用，重新执行相同配置的训练命令即可。仅在当前实验的 `output_dir/project/exp_name/checkpoints/`（默认位于 `work_dirs`）内选择 checkpoint，显式 `resume_from` 优先；否则优先 `ckpt_final.pth`，再选步数最大的 `ckpt_step_XXXXXX.pth`。忽略尚未写完的 `.pth.tmp` 文件，不扫描其他实验或另一种分辨率的目录。成功加载后先校验训练协议、训练/评估清单及采样游标，恢复模型、optimizer、scaler、Python/NumPy/PyTorch 随机状态；按恢复步数继续 cosine/warmup，并先补做该 checkpoint 待完成的评估。自动选择的路径和恢复步数记录在日志与 `provenance.json` 中。
+
+无 checkpoint 时从头训练；已有 checkpoint 若损坏或配置不兼容则报错，不静默覆盖为新实验。训练和最终 mini 均完成时提示完成并返回，不重复训练、评估、飞书通知，也不重写最终 checkpoint。`auto_resume` 只作用于训练，不妨碍独立测试的 `--load_from`。可用 `--no-auto_resume` 关闭，但已有 checkpoint 的目录仍有防覆盖检查；要重新从头跑请使用新的 `exp_name`。这是重启命令后的自动恢复，不负责自动重启被中断的进程；仍按原配置每 5,000 步及最终步保存，未成功落盘的进度需重算。
 
 ### 3.3 飞书关键日志推送
 
@@ -568,12 +572,12 @@ python main_storm.py --config configs/experiment/omniscene_112x200.yaml --mode c
 # CPU 回归检查
 CUDA_VISIBLE_DEVICES='' python -m unittest discover -s tests -v
 
-# 训练恢复：配置须与 checkpoint 的训练协议一致
-python main_storm.py --config configs/experiment/omniscene_112x200.yaml --auto_resume
-# 也可显式指定 --resume_from <checkpoint.pth>
+# 首次运行从头训练；中断后重跑同一命令默认自动恢复，无需额外参数
+python main_storm.py --config configs/experiment/omniscene_112x200.yaml
+# 配置须与 checkpoint 的训练协议一致；也可显式指定 --resume_from <checkpoint.pth>
 ```
 
-从头训练、完整测试的两种分辨率命令见第 5.3 节。新训练若发现输出目录已有 checkpoint，会要求显式恢复或换一个 `exp_name`，避免覆盖已有实验。
+从头训练、完整测试的两种分辨率命令见第 5.3 节。默认自动恢复当前实验目录中的 checkpoint；要独立重跑时换一个 `exp_name`，避免混用已有实验。
 
 训练和评估依赖的 VGG 权重只读取本地缓存：`torch.hub.get_dir()/checkpoints/vgg16-397923af.pth`；STORM 自带 LPIPS 的校准权重默认读取 `~/.cache/torch/hub/checkpoints/vgg.pth`，也可通过 `--lpips_weights` 指定已有文件，校验原项目 MD5。缺失时启动失败并给出路径，不在训练/测试中下载。
 
@@ -610,7 +614,8 @@ python -m tests.check_omniscene_cuda \
 | 检查 | 已验证范围 |
 | --- | --- |
 | CPU 回归 | 14 项：配置继承/覆盖与协议拒绝、相机/目标顺序、无需 LiDAR/confidence/输入视角 mask 的加载、时间无关、掩码梯度、深度有效性、双组 PCC、计时预热、静态渲染接口、100,001 步触发逻辑、真实 checkpoint 故障恢复 |
-| 飞书通知 CPU 回归 | 新增 6 项，合计 20 项通过：默认配置/关闭/旧 checkpoint 兼容、延迟加载及模块路径、双组指标和调试标记、失败隔离及错误脱敏；原恢复测试补充推送触发断言。全部使用模拟发送，无真实飞书消息、无 GPU 占用 |
+| 飞书通知 CPU 回归 | 6 项：默认配置/关闭/旧 checkpoint 兼容、延迟加载及模块路径、双组指标和调试标记、失败隔离及错误脱敏；原恢复测试补充推送触发断言。全部使用模拟发送，无真实飞书消息、无 GPU 占用 |
+| 自动续训 CPU 回归 | 新增 2 项，合计 22 项通过：两个分辨率默认启用、独立测试兼容、当前实验隔离、忽略临时文件、自动选择与显式路径优先级；原故障恢复测试改为不传恢复路径，并加入随机前向，验证恢复后结果与连续训练一致，已完成实验不重写最终 checkpoint |
 | 外部 send_feishu 接口 | 在 storm 环境加载本机真实模块和已有 webhook 配置，拦截 HTTP 请求后验证消息载荷、5 秒 timeout 及返回状态；已补齐 python-dotenv 1.2.3。未测试真实消息送达 |
 | 真实数据 | 训练/完整评估清单各检查前 2 个 bin 的必要资产；非全量扫描 |
 | 与 depthsplat 对照 | 对一个真实 bin 的全部 18 路、两个分辨率，在 crop shim 前比较；RGB、mask、DA2 相同；像素内参最大差分别约 `1.53e-5` / `3.05e-5`，来自归一化/反归一化的浮点舍入 |
