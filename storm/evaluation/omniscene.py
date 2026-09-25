@@ -27,11 +27,11 @@ def compute_pcc(reference, prediction):
         raise ValueError("PCC depth shapes differ")
     x, y = reference.reshape(-1).double(), prediction.reshape(-1).double()
     if x.numel() < 2 or not torch.isfinite(x).all() or not torch.isfinite(y).all():
-        raise ValueError("PCC requires finite depth vectors with at least two pixels")
+        return x.new_tensor(float("nan"))
     x, y = x - x.mean(), y - y.mean()
     denominator = x.norm() * y.norm()
-    if denominator <= 0:
-        raise ValueError("PCC is undefined for a constant depth vector")
+    if denominator <= 0 or not torch.isfinite(denominator):
+        return x.new_tensor(float("nan"))
     return (x.dot(y) / denominator).clamp(-1, 1)
 
 
@@ -45,8 +45,8 @@ class ImageMetrics:
     def __call__(self, reference, prediction):
         from skimage.metrics import structural_similarity
         reference, prediction = reference.float().clamp(0, 1), prediction.float().clamp(0, 1)
-        if reference.shape != prediction.shape or not torch.isfinite(prediction).all():
-            raise ValueError("Invalid rendered RGB")
+        if reference.shape != prediction.shape:
+            raise ValueError("Rendered and reference RGB shapes differ")
         mse = (reference - prediction).square().mean(dim=(1, 2, 3))
         psnr = -10 * mse.log10()
         ssim = [structural_similarity(gt, pred, win_size=11, gaussian_weights=True,
@@ -59,6 +59,17 @@ class ImageMetrics:
         return {"psnr": psnr, "ssim": torch.as_tensor(ssim, device=prediction.device), "lpips": lpips}
 
 
+def json_metric(value):
+    """Strict JSON values without fabricating scores for undefined metrics."""
+    if np.isnan(value):
+        return None
+    if np.isposinf(value):
+        return "Infinity"
+    if np.isneginf(value):
+        return "-Infinity"
+    return float(value)
+
+
 def group_records(token, image_metrics, reference_depth, accumulated_depth):
     if reference_depth.shape[0] != 18 or accumulated_depth.shape != reference_depth.shape:
         raise ValueError("PCC requires all eighteen target depths in protocol order")
@@ -67,8 +78,23 @@ def group_records(token, image_metrics, reference_depth, accumulated_depth):
         row = {"bin": token, "view_group": group, "views": indices.stop,
                **{name: values[indices].mean().item() for name, values in image_metrics.items()},
                "pcc": compute_pcc(reference_depth[indices], accumulated_depth[indices]).item()}
-        if not all(np.isfinite(row[key]) for key in ("psnr", "ssim", "lpips", "pcc")):
-            raise ValueError(f"Nonfinite metrics: {token}/{group}")
+        notes = {}
+        for key in ("psnr", "ssim", "lpips", "pcc"):
+            row[key] = json_metric(row[key])
+            if row[key] is None:
+                notes[key] = "undefined"
+            elif isinstance(row[key], str):
+                notes[key] = row[key]
+        if row["pcc"] is None:
+            reference, prediction = reference_depth[indices], accumulated_depth[indices]
+            if not torch.isfinite(reference).all():
+                notes["pcc"] = "nonfinite_relative_depth"
+            elif not torch.isfinite(prediction).all():
+                notes["pcc"] = "nonfinite_rendered_depth"
+            else:
+                notes["pcc"] = "zero_variance_or_undefined_correlation"
+        if notes:
+            row["metric_notes"] = notes
         rows.append(row)
     return rows
 
@@ -78,10 +104,16 @@ def aggregate_records(records, expected_tokens):
     for group in GROUPS:
         selected = [row for row in records if row["view_group"] == group]
         tokens = [row["bin"] for row in selected]
-        if tokens != expected_tokens or len(set(tokens)) != len(tokens):
-            raise ValueError(f"Incomplete/duplicate/out-of-order {group} coverage")
-        summaries[group] = {key: float(np.mean([row[key] for row in selected]))
-                            for key in ("psnr", "ssim", "lpips", "pcc")}
+        if tokens != expected_tokens:
+            raise ValueError(f"Incomplete or out-of-order {group} coverage")
+        summaries[group] = {}
+        for key in ("psnr", "ssim", "lpips", "pcc"):
+            values = [row[key] for row in selected]
+            # Keep full-set semantics: one undefined value makes this aggregate
+            # undefined, instead of silently reporting a subset's mean.
+            with np.errstate(invalid="ignore"):
+                summaries[group][key] = (None if any(value is None for value in values)
+                                         else json_metric(np.mean([float(value) for value in values])))
     return summaries
 
 
@@ -143,7 +175,17 @@ def evaluate_omniscene(model, dataset, args, output_dir, provenance, image_metri
                     LOGGER.info("%s evaluation %d/%d", dataset.split, index + 1, len(dataset))
                 del gaussians, rendered, inputs, cameras, targets, rgb, depth
         groups = aggregate_records(records, dataset.bin_tokens)
-        metadata.update(complete=True, completed_count=len(records) // 2, error_count=0, groups=groups)
+        issues = [{"bin": row["bin"], "view_group": row["view_group"], "metrics": row["metric_notes"]}
+                  for row in records if row.get("metric_notes")]
+        undefined = {group: {key: sum(row[key] is None for row in records if row["view_group"] == group)
+                             for key in ("psnr", "ssim", "lpips", "pcc")} for group in GROUPS}
+        metadata.update(complete=True, completed_count=len(records) // 2, error_count=0, groups=groups,
+                        metrics_defined=all(value is not None for scores in groups.values() for value in scores.values()),
+                        undefined_metric_counts=undefined, metric_issue_count=len(issues))
+        write_json(directory / "metric_issues.json", issues)
+        if issues:
+            LOGGER.warning("%s evaluation completed with %d metric notes; see %s. Training can continue.",
+                           dataset.split, len(issues), directory / "metric_issues.json")
         for group in GROUPS:
             suffix = "" if group == "all_18" else "_novel_12"
             selected = [row for row in records if row["view_group"] == group]

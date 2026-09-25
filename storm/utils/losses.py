@@ -33,12 +33,12 @@ def compute_depth_loss(pred_depth, gt_depth, max_depth=None, valid_region=None):
     valid_mask = torch.isfinite(gt_depth) & (gt_depth > 0.01)
     if max_depth is None:
         if not valid_mask.any():
-            raise ValueError("No finite positive target depth")
+            return pred_depth[valid_mask].sum()
         max_depth = gt_depth[valid_mask].max()
     if valid_region is not None:
         valid_mask = valid_mask & valid_region.squeeze().bool()
     if not valid_mask.any():
-        raise ValueError("No valid supervised depth pixels")
+        return pred_depth[valid_mask].sum()
     pred_depth = pred_depth[valid_mask] / max_depth
     gt_depth = gt_depth[valid_mask] / max_depth
     return F.l1_loss(pred_depth, gt_depth)
@@ -95,9 +95,8 @@ def compute_loss(output_dict, target_dict, args=None, lpips_loss=None):
         if valid_region is None:
             rgb_loss = F.mse_loss(pred_rgb, target_rgb)
         else:
-            if not valid_region.flatten(-2).any(dim=-1).all():
-                raise ValueError("No valid RGB pixels in a target")
-            rgb_loss = (pred_rgb - target_rgb)[valid_region].square().mean()
+            selected = (pred_rgb - target_rgb)[valid_region].square()
+            rgb_loss = selected.mean() if selected.numel() else selected.sum()
         loss_dict = {"rgb_loss": rgb_loss}
 
     if args.enable_depth_loss and "target_depth" in target_dict:

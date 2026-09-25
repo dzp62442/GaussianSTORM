@@ -17,7 +17,7 @@ import torch
 from main_storm import get_args_parser
 from storm.dataset.omniscene_adapter import prepare_omniscene_batch
 from storm.dataset.omniscene_dataset import CAMERA_IDS, OmniSceneDataset, da2_to_relative_depth
-from storm.evaluation.omniscene import aggregate_records, compute_pcc, group_records
+from storm.evaluation.omniscene import aggregate_records, compute_pcc, evaluate_omniscene, group_records
 from storm.omniscene_config import CAMERAS, ROOT, load_config, parse_args
 from storm.omniscene_runner import TrainingState, select_resume
 from storm.utils.experiment import summarize_times
@@ -204,6 +204,48 @@ class DatasetTests(unittest.TestCase):
         self.assertEqual(float(metrics["rel_depth"].max()), 1)
         self.assertEqual(float(inputs["context_time"].sum()), 0)
 
+    def test_fully_masked_novel_views_are_kept_but_missing_files_still_fail(self):
+        for camera in CAMERAS:
+            for index in (1, 2):
+                path = self.root / "samples_mask_small" / camera / f"{index}.png"
+                Image.fromarray(np.zeros((224, 400), dtype=np.uint8)).save(path)
+        dataset = OmniSceneDataset(self.args, "train")
+        example = dataset[0]
+        self.assertEqual(example["target"]["image"].shape[0], 18)
+        self.assertFalse(example["target"]["masks"][:12].any())
+        self.assertTrue(example["target"]["masks"][12:].all())
+        self.assertTrue(example["target"]["image"][:12].any())
+        self.assertFalse(dataset.check_assets()["errors"])
+        # Do not silently replace absent masks with an all-valid or all-invalid mask.
+        (self.root / "samples_mask_small" / CAMERAS[0] / "1.png").unlink()
+        with self.assertRaises(RuntimeError) as raised:
+            dataset[0]
+        self.assertIsInstance(raised.exception.__cause__, FileNotFoundError)
+
+    def test_depth_values_and_duplicate_manifest_do_not_reject_samples(self):
+        for camera in CAMERAS:
+            for index in (0, 1, 2):
+                np.save(self.root / "samples_dptm_small" / camera / f"{index}_dpt.npy",
+                        np.zeros((224, 400), dtype=np.float32))
+                np.save(self.root / "samples_dpt_small" / camera / f"{index}.npy",
+                        np.ones((224, 400), dtype=np.float32))
+        manifest = self.root / self.args.data_version / self.args.eval_manifest
+        manifest.write_text(json.dumps({"bins": ["fixture", "fixture"]}))
+        # Preserve the supplied geometry, without a positive-focal/determinant threshold.
+        info = pickle.loads(self.bin_path.read_bytes())
+        info["sensor_info"][CAMERAS[0]][1]["sensor2lidar_transform"][2, 2] = 1e-8
+        self.bin_path.write_bytes(pickle.dumps(info))
+        param = self.root / "samples_param_small" / CAMERAS[0] / "1.json"
+        values = json.loads(param.read_text())
+        values["camera_intrinsic"][0][0] = -300
+        param.write_text(json.dumps(values))
+        dataset = OmniSceneDataset(self.args, "total")
+        self.assertEqual(dataset.bin_tokens, ["fixture", "fixture"])
+        example = dataset[0]
+        self.assertEqual(float(example["target"]["depth"].sum()), 0)
+        self.assertTrue(torch.isnan(example["target"]["rel_depth"]).all())
+        self.assertLess(float(example["target"]["intrinsics"][0, 0, 0]), 0)
+
 
 class LossAndMetricTests(unittest.TestCase):
     def test_perceptual_checkpoint_preserves_value_and_gradient(self):
@@ -231,6 +273,7 @@ class LossAndMetricTests(unittest.TestCase):
         depth = torch.rand(1, 1, 18, 4, 5, requires_grad=True)
         mask = torch.ones(1, 1, 18, 4, 5, dtype=torch.bool)
         mask[:, :, :12, :, :2] = False
+        mask[:, :, 0] = False
         target = {"target_image": torch.rand(1, 1, 18, 3, 4, 5),
                   "target_depth": torch.rand_like(depth) + 1, "target_valid_mask": mask}
         output = {"gs_params": {"forward_flow": torch.ones(1, 1, 6, 4, 5, 3)},
@@ -238,6 +281,8 @@ class LossAndMetricTests(unittest.TestCase):
                                      "decoder_depth_key": None, "rgb": pred, "depth": depth}}
         loss_fn = RGBLpipsLoss(enable_perceptual_loss=False)
         before = compute_loss(output, target, args, loss_fn)
+        fallback = compute_loss(output, target, args, None)
+        torch.testing.assert_close(before["rgb_loss"], fallback["rgb_loss"])
         sum(before.values()).backward()
         self.assertEqual(float(pred.grad[~mask].abs().sum()), 0)
         self.assertEqual(float(depth.grad[~mask].abs().sum()), 0)
@@ -249,14 +294,51 @@ class LossAndMetricTests(unittest.TestCase):
         for key in before:
             torch.testing.assert_close(before[key], after[key])
 
+    def test_all_novel_views_masked_lpips_remains_finite_and_has_zero_masked_gradient(self):
+        class SquaredDistance(torch.nn.Module):
+            def forward(self, pred, gt):
+                return (pred - gt).square().mean((1, 2, 3))
+
+        loss_fn = RGBLpipsLoss(enable_perceptual_loss=False, perceptual_weight=.05,
+                               perceptual_chunk_size=1, checkpoint_perceptual=True)
+        loss_fn.perceptual_loss = SquaredDistance()
+        loss_fn.set_perceptual_loss(True)
+        rgb = torch.rand(18, 4, 5, 3, requires_grad=True)
+        target = torch.rand_like(rgb)
+        original_target = target.clone()
+        mask = torch.ones(18, 4, 5, dtype=torch.bool)
+        mask[:12] = False
+        losses = loss_fn(rgb, target, mask)
+        expected_rgb = (rgb[12:] - target[12:]).square().mean()
+        torch.testing.assert_close(losses["rgb_loss"], expected_rgb)
+        # LPIPS keeps the original mean over all 18 views; masked views contribute zero.
+        torch.testing.assert_close(losses["perceptual_loss"], .05 * expected_rgb * (6 / 18))
+        sum(losses.values()).backward()
+        self.assertTrue(torch.isfinite(rgb.grad).all())
+        self.assertEqual(float(rgb.grad[:12].abs().sum()), 0)
+        self.assertGreater(float(rgb.grad[12:].abs().sum()), 0)
+        torch.testing.assert_close(target, original_target)
+        with torch.no_grad():
+            rgb[:12] = 100
+        again = loss_fn(rgb, target, mask)
+        for key in losses:
+            torch.testing.assert_close(losses[key], again[key])
+        empty = loss_fn(rgb, target, torch.zeros_like(mask))
+        for value in empty.values():
+            self.assertEqual(float(value), 0)
+
     def test_native_all_valid_and_depth_guards(self):
         rgb, gt = torch.rand(2, 8, 8, 3), torch.rand(2, 8, 8, 3)
         loss_fn = RGBLpipsLoss(enable_perceptual_loss=False)
         torch.testing.assert_close(loss_fn(rgb, gt)["rgb_loss"], loss_fn(rgb, gt, torch.ones(2, 8, 8, dtype=torch.bool))["rgb_loss"])
         pred, depth = torch.rand(2, 8, 8), torch.rand(2, 8, 8) + 1
         torch.testing.assert_close(compute_depth_loss(pred, depth), (pred / depth.max() - depth / depth.max()).abs().mean())
-        with self.assertRaises(ValueError):
-            compute_depth_loss(pred, torch.zeros_like(depth))
+        for truth in (torch.zeros_like(depth), torch.full_like(depth, float("nan")), depth):
+            predicted = pred.detach().clone().requires_grad_()
+            empty = compute_depth_loss(predicted, truth, valid_region=torch.zeros_like(truth, dtype=torch.bool))
+            self.assertEqual(float(empty), 0)
+            empty.backward()
+            self.assertEqual(float(predicted.grad.abs().sum()), 0)
 
     def test_grouped_pearson_is_flattened_per_bin(self):
         torch.manual_seed(2)
@@ -272,10 +354,79 @@ class LossAndMetricTests(unittest.TestCase):
         self.assertEqual(summary["all_18"]["psnr"], 8.5)
         with self.assertRaises(ValueError):
             aggregate_records(rows + rows, ["bin"])
-        with self.assertRaises(ValueError):
-            compute_pcc(reference, torch.ones_like(reference))
-        with self.assertRaises(ValueError):
-            da2_to_relative_depth(np.ones((8, 9), dtype=np.float32))
+        self.assertTrue(torch.isnan(compute_pcc(reference, torch.ones_like(reference))))
+        self.assertTrue(np.isnan(da2_to_relative_depth(np.ones((8, 9), dtype=np.float32))).all())
+
+    def test_undefined_metrics_preserve_bins_and_do_not_average_a_subset(self):
+        ref = torch.arange(18 * 4 * 5).float().reshape(18, 4, 5)
+        metrics = {key: torch.ones(18) for key in ("psnr", "ssim", "lpips")}
+        first = group_records("a", metrics, ref, torch.ones_like(ref))
+        second = group_records("b", {**metrics, "psnr": torch.full((18,), float("inf"))}, ref, ref)
+        self.assertIsNone(first[0]["pcc"])
+        self.assertIn("pcc", first[0]["metric_notes"])
+        self.assertEqual(second[0]["psnr"], "Infinity")
+        summary = aggregate_records(first + second, ["a", "b"])
+        self.assertIsNone(summary["all_18"]["pcc"])
+        self.assertEqual(summary["novel_12"]["ssim"], 1.)
+        self.assertEqual(summary["all_18"]["psnr"], "Infinity")
+        json.dumps(summary, allow_nan=False)
+        # Repeated samples explicitly present in the manifest retain their multiplicity.
+        self.assertEqual(aggregate_records(second + second, ["b", "b"])["all_18"]["pcc"], 1.)
+
+    def test_evaluation_finishes_and_writes_undefined_metric_diagnostics(self):
+        args = config("--num_workers", "0", "--set", "timing_warmup_samples=0")
+        shape = (18, 4, 5)
+        reference = torch.arange(np.prod(shape)).float().reshape(shape)
+
+        class Dataset(torch.utils.data.Dataset):
+            split = "mini"
+            bin_tokens = ["constant", "defined"]
+
+            def __len__(self):
+                return 2
+
+            def __getitem__(self, index):
+                return {"scene": self.bin_tokens[index], "index": index}
+
+            def metadata(self):
+                return dict(split=self.split, bins=self.bin_tokens, expected_count=2,
+                            uncapped_count=2, limited=False)
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(()))
+
+            def reconstruct_static(self, inputs):
+                return {"means": torch.zeros(1, 5, 3)}
+
+            def render_static(self, gaussians, cameras, **kwargs):
+                return {"rendered_image": torch.zeros(1, 1, *shape, 3),
+                        "accumulated_depth": reference[None, None]}
+
+        def prepare(batch, *unused):
+            ref = torch.full_like(reference, float("nan")) if int(batch["index"][0]) == 0 else reference
+            return ({"context_image": torch.zeros(1, 1, 6, 3, 4, 5)}, {}, {},
+                    {"rgb": torch.zeros(1, 18, 3, 4, 5), "rel_depth": ref[None]})
+
+        metric = lambda *unused: {key: torch.ones(18) for key in ("psnr", "ssim", "lpips")}
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("storm.evaluation.omniscene.prepare_omniscene_batch", side_effect=prepare), \
+                patch("storm.evaluation.omniscene.dependency_versions", return_value={}):
+            model = Model().train()
+            summary = evaluate_omniscene(model, Dataset(), args, directory, {}, metric)
+            self.assertTrue(summary["complete"])
+            self.assertEqual(summary["completed_count"], 2)
+            self.assertFalse(summary["metrics_defined"])
+            self.assertEqual(summary["undefined_metric_counts"]["all_18"]["pcc"], 1)
+            self.assertIsNone(summary["groups"]["all_18"]["pcc"])
+            issues = json.loads((Path(directory) / "metric_issues.json").read_text())
+            self.assertEqual(len(issues), 2)
+            self.assertEqual(issues[0]["bin"], "constant")
+            self.assertEqual(len((Path(directory) / "records.jsonl").read_text().splitlines()), 4)
+            self.assertTrue(model.training)
+            saved = json.loads((Path(directory) / "summary.json").read_text())
+            self.assertEqual(saved["groups"], summary["groups"])
 
     def test_timer_warmup_does_not_remove_quality_rows(self):
         times = [{"bin": str(i), "milliseconds": float(i)} for i in range(8)]

@@ -34,6 +34,14 @@ def _parameters(counts):
             f"总计 {counts['total']:,}")
 
 
+def _score(value, decimals):
+    if value is None:
+        return "未定义"
+    if isinstance(value, str):
+        return {"Infinity": "+∞", "-Infinity": "-∞"}.get(value, value)
+    return f"{value:.{decimals}f}"
+
+
 class FeishuNotifier:
     def __init__(self, args, log_dir):
         self.args = args
@@ -96,14 +104,18 @@ class FeishuNotifier:
         title = "GaussianSTORM OmniScene 最终 mini 测试完成" if final else "GaussianSTORM OmniScene mini 测试完成"
         if summary.get("limited"):
             title += "（调试截断）"
+        if summary.get("metrics_defined") is False:
+            title += "（含未定义指标）"
         lines = self._context(step) + [
             f"mini 覆盖：{summary['completed_count']}/{summary['expected_count']} bin；"
             f"未截断集合：{summary['uncapped_count']} bin",
         ]
         for group in ("all_18", "novel_12"):
             scores = summary["groups"][group]
-            lines.append(f"{group}：PSNR {scores['psnr']:.3f}，SSIM {scores['ssim']:.4f}，"
-                         f"LPIPS {scores['lpips']:.4f}，PCC {scores['pcc']:.4f}")
+            lines.append(f"{group}：PSNR {_score(scores['psnr'], 3)}，SSIM {_score(scores['ssim'], 4)}，"
+                         f"LPIPS {_score(scores['lpips'], 4)}，PCC {_score(scores['pcc'], 4)}")
+        if summary.get("metrics_defined") is False:
+            lines.append("未定义项计数：" + json.dumps(summary["undefined_metric_counts"], ensure_ascii=False))
         lines.append(_parameters(parameters))
         timing_path = Path(output_dir) / "reconstruction_time.json"
         try:

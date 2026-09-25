@@ -292,7 +292,7 @@ def train(model, args, device, log_dir, checkpoints, provenance):
             if logger:
                 logger.set_step(state.completed_steps)
                 logger.update({f"{dataset.split}/{group}/{key}": value for group, scores in summary["groups"].items()
-                               for key, value in scores.items()})
+                               for key, value in scores.items() if value is not None and not isinstance(value, str)})
             write_json(log_dir / "training_state.json", asdict(state))
             if dataset.split == "mini":
                 elapsed = time.perf_counter() - started_at

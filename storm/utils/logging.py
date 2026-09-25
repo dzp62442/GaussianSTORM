@@ -204,19 +204,19 @@ class WandbLogger:
     def __init__(self, args, resume="must", id=None):
         if id is None:
             resume = "allow" if resume else "never"
+        mode = getattr(args, "wandb_mode", None) if args.dataset == "omniscene" else None
         wandb.init(
             config=args,
             entity=args.entity,
             project=args.project,
             name=args.exp_name,
             dir=args.log_dir,
-            resume=resume,
+            resume=None if mode == "offline" else resume,
             id=id,
-            mode=getattr(args, "wandb_mode", None) if args.dataset == "omniscene" else None,
+            mode=mode,
         )
         self.run_id = wandb.run.id
         self.step = 0
-        wandb.run.save()
 
     @staticmethod
     def wandb_safe_log(*args, **kwargs):

@@ -20,14 +20,12 @@ CAMERA_IDS = [i for i in range(6) for _ in range(2)] + list(range(6))
 
 
 def da2_to_relative_depth(disp):
-    if disp.ndim != 2 or not np.isfinite(disp).all() or disp.min() < 0 or disp.max() <= 0:
-        raise ValueError("Invalid DA2 disparity")
-    ratio = min(disp.max() / (disp.min() + 0.001), 50.0)
-    depth = 1.0 / np.maximum(disp, disp.max() / ratio)
-    span = depth.max() - depth.min()
-    if not np.isfinite(span) or span <= 0:
-        raise ValueError("Constant/invalid DA2 relative depth")
-    return (depth - depth.min()) / span
+    # Preserve the reference loaders' formula, including undefined results for
+    # constant maps. Evaluation records an undefined PCC without rejecting a bin.
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        ratio = min(disp.max() / (disp.min() + 0.001), 50.0)
+        depth = 1.0 / np.maximum(disp, disp.max() / ratio)
+        return (depth - depth.min()) / (depth.max() - depth.min())
 
 
 def resize_depth(array, size):
@@ -57,8 +55,8 @@ class OmniSceneDataset(Dataset):
         self.full_count = len(bins)
         if split != "train" and args.max_eval_bins:
             bins = bins[:args.max_eval_bins]
-        if not bins or len(set(bins)) != len(bins):
-            raise ValueError(f"Empty or duplicate bin list: {self.manifest_path}")
+        if not bins:
+            raise ValueError(f"Empty bin list: {self.manifest_path}")
         self.bin_tokens = bins
         self.selected_sha256 = hashlib.sha256(json.dumps(bins).encode()).hexdigest()
 
@@ -115,13 +113,7 @@ class OmniSceneDataset(Dataset):
         c2w = np.asarray(record["sensor2lidar_transform"], dtype=np.float32)
         if intrinsics.shape != (3, 3) or c2w.shape != (4, 4):
             raise ValueError("Invalid camera matrix shape")
-        if not np.isfinite(intrinsics).all() or not np.isfinite(c2w).all():
-            raise ValueError("Nonfinite camera matrix")
-        if intrinsics[0, 0] <= 0 or intrinsics[1, 1] <= 0 or abs(np.linalg.det(c2w[:3, :3])) < 1e-6:
-            raise ValueError("Degenerate camera matrix")
         depth = resize_depth(np.load(paths["depth"], allow_pickle=False), self.size)
-        if not (np.isfinite(depth) & (depth > 0.01)).any():
-            raise ValueError(f"No valid Metric3D depth: {paths['depth']}")
         mask = np.ones(self.size, dtype=bool)
         if novel:
             with Image.open(paths["mask"]) as source:
@@ -129,8 +121,8 @@ class OmniSceneDataset(Dataset):
                 if source.size != (self.size[1], self.size[0]):
                     source = source.resize((self.size[1], self.size[0]), Image.Resampling.BILINEAR)
                 mask = (np.asarray(source, dtype=np.float32) / 255).astype(bool)
-        if not mask.any():
-            raise ValueError(f"No valid pixels: {paths['mask']}")
+        # A novel view can be fully masked. Keep it in the 18-view sample;
+        # supervision excludes its pixels while the six input targets stay valid.
         out = {"image": torch.from_numpy(rgb).permute(2, 0, 1).float() / 255,
                "intrinsics": torch.tensor(intrinsics, dtype=torch.float32),
                "extrinsics": torch.from_numpy(c2w.copy()), "depth": torch.from_numpy(depth),

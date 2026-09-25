@@ -68,9 +68,8 @@ class RGBLpipsLoss(nn.Module):
             rgb_loss = F.mse_loss(rgb, targets)
         else:
             valid_mask = rearrange(valid_mask, "... h w -> (...) 1 h w").bool()
-            if not valid_mask.flatten(1).any(dim=1).all():
-                raise ValueError("No valid RGB pixels in a target")
-            rgb_loss = (rgb - targets).masked_select(valid_mask.expand_as(rgb)).square().mean()
+            selected = (rgb - targets).masked_select(valid_mask.expand_as(rgb)).square()
+            rgb_loss = selected.mean() if selected.numel() else selected.sum()
         loss_dict = {"rgb_loss": rgb_loss}
         if self.enable_perceptual_loss:
             if valid_mask is not None:

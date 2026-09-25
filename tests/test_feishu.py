@@ -98,6 +98,21 @@ class FeishuTests(unittest.TestCase):
                 notifier.mini_completed({**SUMMARY, **changed}, directory, 1000, PARAMETERS)
             loader.assert_not_called()
 
+    def test_undefined_metrics_can_be_reported_without_interrupting_training(self):
+        with tempfile.TemporaryDirectory() as directory, patch("storm.utils.feishu.load_sender") as loader:
+            sender = loader.return_value = Mock(return_value=True)
+            summary = deepcopy(SUMMARY)
+            summary["groups"]["novel_12"]["pcc"] = None
+            summary["groups"]["all_18"]["psnr"] = "Infinity"
+            summary["metrics_defined"] = False
+            summary["undefined_metric_counts"] = {"novel_12": {"pcc": 1}}
+            FeishuNotifier(config(), directory).mini_completed(summary, directory, 10000, PARAMETERS)
+            sender.assert_called_once()
+            title, body = sender.call_args.args
+            self.assertIn("含未定义指标", title)
+            self.assertIn("PCC 未定义", body)
+            self.assertIn("PSNR +∞", body)
+
     def test_failure_does_not_raise_or_leak_sender_errors(self):
         with tempfile.TemporaryDirectory() as directory, patch("storm.utils.feishu.load_sender") as loader:
             notifier = FeishuNotifier(config(), directory)
