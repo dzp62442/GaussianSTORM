@@ -1,5 +1,6 @@
 data/
 data
+work_dirs
 work_dirs/
 local_scripts/
 sync_files.sh
